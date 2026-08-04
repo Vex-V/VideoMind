@@ -1,0 +1,197 @@
+{
+  "video": "uploads\\speech_test.mp4",
+  "preset": "audio",
+  "params": {
+    "min_duration": 5.0,
+    "max_duration": 20.0
+  },
+  "chunks": [
+    {
+      "id": 0,
+      "start": 0.0,
+      "end": 6.9,
+      "transcript": "You have the pretty little shell going on.",
+      "diarization": {
+        "text": "SPEAKER_01: You have the pretty little shell going on.",
+        "plain": "You have the pretty little shell going on.",
+        "turns": [
+          {
+            "speaker": "SPEAKER_01",
+            "start": 0.27,
+            "end": 2.27,
+            "text": "You have the pretty little shell going on."
+          }
+        ],
+        "speakers": [
+          "SPEAKER_01"
+        ]
+      }
+    },
+    {
+      "id": 1,
+      "start": 6.9,
+      "end": 12.5,
+      "transcript": ""
+    },
+    {
+      "id": 2,
+      "start": 12.5,
+      "end": 18.5,
+      "transcript": "There you go. It's a turtle. There you go. So what are your favorite characteristics?",
+      "diarization": {
+        "text": "SPEAKER_01: There you go. It's a turtle. There you go. So what are your favorite characteristics?",
+        "plain": "There you go. It's a turtle. There you go. So what are your favorite characteristics?",
+        "turns": [
+          {
+            "speaker": "SPEAKER_01",
+            "start": 12.5,
+            "end": 18.5,
+            "text": "There you go. It's a turtle. There you go. So what are your favorite characteristics?"
+          }
+        ],
+        "speakers": [
+          "SPEAKER_01"
+        ]
+      }
+    },
+    {
+      "id": 3,
+      "start": 18.5,
+      "end": 24.8,
+      "transcript": "I like the whole heaven of shelving. Hmm. It's quite cool. Carry your home around where you go. Off.",
+      "diarization": {
+        "text": "SPEAKER_01: I like the whole heaven of shelving. Hmm. It's quite cool. Carry your home around where you go. Off.",
+        "plain": "I like the whole heaven of shelving. Hmm. It's quite cool. Carry your home around where you go. Off.",
+        "turns": [
+          {
+            "speaker": "SPEAKER_01",
+            "start": 18.5,
+            "end": 25.5,
+            "text": "I like the whole heaven of shelving. Hmm. It's quite cool. Carry your home around where you go. Off."
+          }
+        ],
+        "speakers": [
+          "SPEAKER_01"
+        ]
+      }
+    },
+    {
+      "id": 4,
+      "start": 24.8,
+      "end": 32.1,
+      "transcript": "quite decorative little animals, they can swim, they can, they're very adaptable, they carry everything they need with them.",
+      "diarization": {
+        "text": "SPEAKER_01: quite decorative little animals, they can swim, they can, they're very adaptable, they carry everything they need with them.",
+        "plain": "quite decorative little animals, they can swim, they can, they're very adaptable, they carry everything they need with them.",
+        "turns": [
+          {
+            "speaker": "SPEAKER_01",
+            "start": 24.8,
+            "end": 32.8,
+            "text": "quite decorative little animals, they can swim, they can, they're very adaptable, they carry everything they need with them."
+          }
+        ],
+        "speakers": [
+          "SPEAKER_01"
+        ]
+      }
+    },
+    {
+      "id": 5,
+      "start": 32.1,
+      "end": 40.0,
+      "transcript": "and they're easy to draw. Excellent. So you just go around the table.",
+      "diarization": {
+        "text": "SPEAKER_01: and they're easy to draw.\nSPEAKER_02: Excellent. So you just go around the table.",
+        "plain": "and they're easy to draw. Excellent. So you just go around the table.",
+        "turns": [
+          {
+            "speaker": "SPEAKER_01",
+            "start": 34.2,
+            "end": 36.2,
+            "text": "and they're easy to draw."
+          },
+          {
+            "speaker": "SPEAKER_02",
+            "start": 36.2,
+            "end": 40.2,
+            "text": "Excellent. So you just go around the table."
+          }
+        ],
+        "speakers": [
+          "SPEAKER_01",
+          "SPEAKER_02"
+        ]
+      }
+    },
+    {
+      "id": 6,
+      "start": 40.0,
+      "end": 46.0,
+      "transcript": "Okay, well, my name is Ian.",
+      "diarization": {
+        "text": "SPEAKER_00: Okay, well, my name is Ian.",
+        "plain": "Okay, well, my name is Ian.",
+        "turns": [
+          {
+            "speaker": "SPEAKER_00",
+            "start": 40.27,
+            "end": 42.27,
+            "text": "Okay, well, my name is Ian."
+          }
+        ],
+        "speakers": [
+          "SPEAKER_00"
+        ]
+      }
+    },
+    {
+      "id": 7,
+      "start": 46.0,
+      "end": 52.6,
+      "transcript": "in space designer for the project. Join for me.",
+      "diarization": {
+        "text": "SPEAKER_00: in space designer for the project. Join for me.",
+        "plain": "in space designer for the project. Join for me.",
+        "turns": [
+          {
+            "speaker": "SPEAKER_00",
+            "start": 46.0,
+            "end": 53.07,
+            "text": "in space designer for the project. Join for me."
+          }
+        ],
+        "speakers": [
+          "SPEAKER_00"
+        ]
+      }
+    },
+    {
+      "id": 8,
+      "start": 52.6,
+      "end": 60.032,
+      "transcript": "I should leave her on her.",
+      "diarization": {
+        "text": "SPEAKER_00: I should leave her on her.",
+        "plain": "I should leave her on her.",
+        "turns": [
+          {
+            "speaker": "SPEAKER_00",
+            "start": 58.95,
+            "end": 60.95,
+            "text": "I should leave her on her."
+          }
+        ],
+        "speakers": [
+          "SPEAKER_00"
+        ]
+      }
+    }
+  ],
+  "analyzers": [
+    "diarization",
+    "transcript"
+  ],
+  "video_id": "729164dcc92520ed",
+  "chunk_config": "audio:5-20"
+}
