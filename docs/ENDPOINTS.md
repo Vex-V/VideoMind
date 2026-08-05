@@ -4,33 +4,77 @@ Base URL `http://127.0.0.1:8077`. Interactive docs at `/docs`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/` | The web UI |
-| `GET` | `/analyzers` | Registered analyzers and vector fields |
+| `GET` | `/` | The web UI (absent when started with `--api-only`) |
+| `GET` | `/health` | Liveness, plus what this instance has loaded |
 | `GET` | `/schema` | Everything searchable and filterable — read this first |
+| `GET` | `/analyzers` | Registered analyzers and vector fields |
 | `GET` | `/videos` | Ingested videos |
 | `GET` | `/videos/{video_id}` | One video's metadata |
 | `GET` | `/videos/{video_id}/chunks` | Stored analyzer output, scoped and paginated |
 | `GET` | `/videos/{video_id}/chunks/{chunk_id}` | Everything produced for one chunk |
+| `GET` | `/videos/{video_id}/aggregates` | Video-level results: summary, chapters, entities… |
+| `POST` | `/videos/{video_id}/aggregates` | Re-run aggregators without re-analysing |
+| `GET` | `/videos/{video_id}/entities` | People linked across chunks, with timelines |
 | `POST` | `/videos` | Upload a video and start ingestion |
-| `GET` | `/jobs/{job_id}` | Ingestion progress |
+| `GET` | `/jobs/{job_id}` | Job progress |
 | `GET` | `/jobs` | All jobs this process has seen |
 | `POST` | `/query` | Search, optionally with a synthesised answer |
 | `POST` | `/ask` | Answer a question using aggregates as well as segments |
 | `GET` | `/media/{video_id}` | Stream a video (supports range requests) |
 
+Everything is a read except `POST /videos`, which spends time and money.
+`POST /query` and `POST /ask` are POSTs only because their bodies are too
+complex for a query string — they change nothing.
+
+---
+
+## `GET /health`
+
+```json
+{ "status": "ok", "ui": true,
+  "analyzers": ["default_video", "diarization", "object_detection", "ocr", "people", "transcript"],
+  "aggregators": ["chapters", "cooccurrence", "entities", "entity_timelines", "events",
+                  "ner", "novelty", "object_entities", "sentiment", "speaker_stats",
+                  "stats", "summary"] }
+```
+
+`ui` is false when the server was started with `--api-only`.
+
+---
+
+## `GET /schema`
+
+What this install can do, in one call — analyzers, vector fields, detail
+levels, every filter with its type, and every aggregator with its dependencies
+and whether it costs API calls. Read this before constructing queries rather
+than guessing field names.
+
+```json
+{
+  "analyzers": [...], "exclusive_groups": [["diarization", "transcript"]],
+  "vector_fields": { "combined": "whole flattened record (default)", ... },
+  "detail_levels": { "minimal": "...", "standard": "...", "full": "..." },
+  "filters": { "video_ids": {"type": "list[str]", "matches": "any", "payload_field": "video_id"}, ... },
+  "aggregators": { "summary": {"depends_on": [], "uses_llm": true}, ... }
+}
+```
+
 ---
 
 ## `GET /analyzers`
 
-What can be run and searched. Use it to populate dropdowns rather than
-hardcoding names.
+The subset of `/schema` a UI needs to populate dropdowns.
 
 ```json
 {
-  "analyzers": ["default_video", "transcript"],
-  "fields": ["combined", "description", "people", "actions", "objects"]
+  "analyzers": ["default_video", "diarization", "object_detection", "ocr", "people", "transcript"],
+  "fields": ["combined", "description", "people", "actions", "objects"],
+  "exclusive_groups": [["diarization", "transcript"]]
 }
 ```
+
+`exclusive_groups` lists analyzer sets that cannot be selected together, so a
+client can enforce it rather than discovering it as a 400.
 
 ---
 
@@ -170,6 +214,90 @@ analyzer's output for it.
 
 ---
 
+## `GET /videos/{video_id}/aggregates`
+
+Video-level results. Pass `?aggregator=summary` for one, or omit for all.
+
+| aggregator | depends on | LLM | produces |
+|---|---|---|---|
+| `stats` | – | no | counts over time, busiest/quietest moment, speech totals |
+| `novelty` | – | no | chunks ranked by how unlike the rest they are, plus outliers |
+| `speaker_stats` | `diarization` | no | talk time, turns, handovers, share per speaker |
+| `sentiment` | `diarization` | no | sentiment of spoken language, per speaker and over time |
+| `ner` | – | no | named entities across speech, scene text and OCR |
+| `summary` | – | **yes** | tiered summaries, finest first, plus key points and topics |
+| `chapters` | – | **yes** | consecutive chunks grouped into titled sections |
+| `events` | – | **yes** | discrete timestamped events with actor and category |
+| `entities` | `people` | **yes** | people linked across chunks, with narratives |
+| `entity_timelines` | `entities` | no | presence and dwell time per person |
+| `cooccurrence` | `entities` | no | which people appear together |
+| `object_entities` | `object_detection` | **yes** | objects tracked across chunks |
+
+An aggregator whose analyzer the video lacks is **skipped, not failed** — the
+entity chain needs `people`, `sentiment` and `speaker_stats` need
+`diarization`.
+
+`summary` returns a hierarchy built by halving the video until a leaf covers a
+few chunks, so `tiers[0]` is the finest and the last is the whole video. Depth
+follows length rather than a fixed block size; a 39-chunk video produced 4
+tiers of 8 / 4 / 2 / 1 sections.
+
+**400** if the video has no such aggregate (the message lists what it does
+have); **404** for an unknown video.
+
+---
+
+## `POST /videos/{video_id}/aggregates`
+
+Re-run aggregators. Returns **202** and a `job_id` to poll.
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `aggregators` | form string | all | Comma-separated ids |
+| `force` | query bool | `true` | Recompute even when already stored |
+
+Aggregators read `records/`, not the video, so this costs no re-analysis.
+Results are **cached**: with `force=false` anything already stored is reused,
+which matters because `summary`, `chapters`, `events`, `entities` and
+`object_entities` each bill API calls. Ingestion uses `force=false`, so
+re-uploading a video to add one analyzer does not re-buy its summary.
+
+Aggregates are recomputed automatically when the **analyzer set changes** — a
+summary written before `people` ran describes a video it could not see people
+in, and serving it would be confidently out of date.
+
+```json
+{ "video_id": "...", "ran": [], "reused": ["summary", "chapters", ...],
+  "skipped": ["sentiment", "speaker_stats"], "failed": {},
+  "llm_calls_saved": ["chapters", "entities", "events", "object_entities", "summary"],
+  "recomputed_because_analyzers_changed": false }
+```
+
+---
+
+## `GET /videos/{video_id}/entities`
+
+People linked across chunks, each merged with its timeline when
+`entity_timelines` has run.
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `min_appearances` | int | `1` | Only people seen in at least this many chunks |
+
+```json
+{ "video_id": "...", "total": 21, "entities": [ {
+  "entity_id": "6b9ca6e1-p003", "appearances": 13, "chunk_ids": [0,1,2,3,...],
+  "first_seen": 0.0, "last_seen": 233.4,
+  "description": "A woman in a light gray T-shirt with red lettering...",
+  "narrative": "She worked the right-side checkout register...",
+  "timeline": { "observed_seconds": 149.4, "spans": [...] } } ] }
+```
+
+Use `min_appearances=2` for people actually followed across the video; someone
+seen once is fully described by their chunk already.
+
+---
+
 ## `POST /query`
 
 `application/json`.
@@ -195,6 +323,7 @@ results.
 ```json
 "filters": {
   "chunk_ids": [2, 4, 7],          "video_ids": ["6b9ca6e1..."],
+  "analyzer_ids": ["people"],
   "after": 60, "before": 300,      "min_people": 9, "max_people": 3,
   "objects": ["shopping cart"],    "tags": ["checkout"],
   "speakers": ["SPEAKER_00"],      "people": ["cashier"],
@@ -319,6 +448,7 @@ requires no changes to ingest, the vector store, or these endpoints.
 | `transcript` | audio | Plain speech text per chunk |
 | `diarization` | audio | Speaker-attributed transcript: `turns` of `{speaker, start, end, text}` plus `speakers` |
 | `ocr` | frames | On-screen text: `texts` of `{text, context}` plus a `summary` |
+| `people` | frames | Per person: appearance, clothing, role, action, and box `locations` |
 | `object_detection` | frames | Objects in detail: `detections` of `{object, description, context}`, plus plain names in `objects` |
 
 `transcript` and `diarization` are **mutually exclusive** — `GET /analyzers`

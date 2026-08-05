@@ -9,6 +9,7 @@ from .base import AggregateContext, Aggregator
 from .chapters import ChaptersAggregator
 from .entities import CooccurrenceAggregator, EntityAggregator, EntityTimelineAggregator
 from .events import EventsAggregator
+from .object_entities import ObjectEntityAggregator
 from .ner import NERAggregator
 from .novelty import NoveltyAggregator
 from .sentiment import SentimentAggregator
@@ -28,13 +29,14 @@ REGISTRY: dict[str, Aggregator] = {
         NERAggregator(),
         SentimentAggregator(),
         EntityAggregator(),
+        ObjectEntityAggregator(),
         EntityTimelineAggregator(),
         CooccurrenceAggregator(),
     )
 }
 
 # Which of these cost API calls, so a caller can pick the free ones.
-USES_LLM = frozenset({"summary", "chapters", "events", "entities"})
+USES_LLM = frozenset({"summary", "chapters", "events", "entities", "object_entities"})
 
 
 def get(aggregator_id: str) -> Aggregator:

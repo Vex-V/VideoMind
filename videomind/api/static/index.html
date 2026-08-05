@@ -481,6 +481,7 @@ function renderInsights(vid,a,available){
   if(a.stats)          out.push(panelStats(vid,a.stats));
   if(a.novelty)        out.push(panelNovelty(vid,a.novelty));
   if(a.entities)       out.push(panelEntities(vid,a.entities,a.entity_timelines));
+  if(a.object_entities)out.push(panelObjects(vid,a.object_entities));
   if(a.events)         out.push(panelEvents(vid,a.events));
   if(a.speaker_stats)  out.push(panelSpeakers(vid,a.speaker_stats));
   if(a.sentiment)      out.push(panelSentiment(vid,a.sentiment));
@@ -561,6 +562,25 @@ function panelEntities(vid,e,timelines){
         ${x.narrative?`<div class="desc" style="font-size:12.5px;margin-bottom:6px">${esc(x.narrative)}</div>`:''}
         <div>${x.observations.map(o=>`<button class="ts ghost" onclick="seekTo('${vid}',${o.start})">${fmt(o.start)}</button>`).join(' ')}</div>
       </div>`;}).join('') || '<div class="empty">Nobody appeared in more than one chunk.</div>'}`);
+}
+
+function panelObjects(vid,o){
+  const tracked=o.objects.filter(x=>x.appearances>1);
+  return panel('Objects', `${o.linked} tracked / ${o.total}`, `
+    <div class="muted" style="font-size:12px;margin-bottom:8px">
+      ${o.observations} sightings resolved into ${o.total} objects; ${o.unlinked} seen once.
+      ${o.people_sightings?`${o.people_sightings} person sightings handed to People.`:''}</div>
+    ${tracked.slice(0,8).map(x=>`<div class="card">
+        <h3>${esc(x.name)}</h3>
+        <div class="muted" style="font-size:11.5px;margin-bottom:6px">
+          ${esc(x.role||'')} · seen ${x.appearances}× · ${fmt(x.first_seen)}–${fmt(x.last_seen)}</div>
+        <div class="desc" style="font-size:12.5px;margin-bottom:6px">
+          ${esc(x.narrative || x.description || x.signature)}</div>
+        <div>${x.observations.slice(0,10).map(ob=>
+          `<button class="ts ghost" onclick="seekTo('${vid}',${ob.start})">${fmt(ob.start)}</button>`).join(' ')}</div>
+      </div>`).join('') || '<div class="empty">No object appeared in more than one chunk.</div>'}
+    ${o.fixtures?.length?`<div class="facets" style="margin-top:8px"><b>fixtures (counted, not tracked):</b>
+      ${o.fixtures.slice(0,8).map(f=>`<span class="pill">${esc(f[0])} ${f[1]}</span>`).join('')}</div>`:''}`);
 }
 
 const panelEvents = (vid,e) => panel('Events', e.events.length, `

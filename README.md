@@ -61,7 +61,8 @@ video, so re-running one costs no re-analysis. Results are cached and only
 recomputed on demand or when the analyzer set changes.
 
 `stats` · `novelty` · `speaker_stats` · `summary` · `chapters` · `events` ·
-`ner` · `sentiment` · `entities` · `entity_timelines` · `cooccurrence`
+`ner` · `sentiment` · `entities` · `object_entities` · `entity_timelines` ·
+`cooccurrence`
 
 **Retrieval** stores one point per chunk in Qdrant with several named vectors
 (`combined`, `description`, `people`, `actions`, `objects`), so a query about

@@ -32,6 +32,89 @@ and do not invent a reason for the difference. Never give the person a name.
 {observations}"""
 
 
+def link_observations(
+    observations: list[dict],
+    link_threshold: float,
+    generic_threshold: float,
+    dedupe_threshold: float,
+) -> tuple[list[list[int]], np.ndarray]:
+    """Group observations of the same subject, by appearance under constraints.
+
+    Shared by people and objects: the reasoning is identical either way, only
+    the source field differs. Returns index groups plus each observation's
+    genericness, so callers can report what was too vague to link.
+
+    Constraints, in order:
+      within-chunk merge - the analyzer's own tracker splits one subject into
+        two sightings of the same chunk; merged first, otherwise cannot-link
+        would permanently forbid reuniting them
+      cannot-link        - two subjects visible in the same chunk are different
+      distinctness       - a description resembling everything identifies
+        nothing, so its owner stays unlinked rather than being merged into
+        whatever it drifted closest to
+    """
+    count = len(observations)
+    if count < 2:
+        return [[i] for i in range(count)], np.zeros(count)
+
+    embedder = get_embedder()
+    vectors = embedder.embed_documents([o["signature"] for o in observations])
+    similarity = vectors @ vectors.T
+
+    merged_into: dict[int, int] = {}
+    for i in range(count):
+        if i in merged_into:
+            continue
+        for j in range(i + 1, count):
+            if j in merged_into:
+                continue
+            if (observations[i]["chunk_id"] == observations[j]["chunk_id"]
+                    and similarity[i][j] >= dedupe_threshold):
+                merged_into[j] = i
+
+    live = [i for i in range(count) if i not in merged_into]
+    index_of = {original: position for position, original in enumerate(live)}
+
+    sub = similarity[np.ix_(live, live)]
+    n = len(live)
+    genericness = (sub - np.eye(n)).sum(axis=1) / max(n - 1, 1)
+    distinctive = genericness < generic_threshold
+
+    cluster_of = list(range(n))
+    members = {i: [i] for i in range(n)}
+    pairs = [
+        (sub[i][j], i, j)
+        for i in range(n) for j in range(i + 1, n)
+        if sub[i][j] >= link_threshold
+        and observations[live[i]]["chunk_id"] != observations[live[j]]["chunk_id"]
+        and distinctive[i] and distinctive[j]
+    ]
+    for _score, i, j in sorted(pairs, key=lambda p: -p[0]):
+        a, b = cluster_of[i], cluster_of[j]
+        if a == b:
+            continue
+        chunks_a = {observations[live[m]]["chunk_id"] for m in members[a]}
+        chunks_b = {observations[live[m]]["chunk_id"] for m in members[b]}
+        if chunks_a & chunks_b:
+            continue  # merging would put one subject in two places at once
+        members[a].extend(members[b])
+        for m in members[b]:
+            cluster_of[m] = a
+        del members[b]
+
+    groups = []
+    for indices in sorted(members.values(), key=min):
+        originals = [live[i] for i in indices]
+        # Fold each within-chunk duplicate back into whichever group absorbed it.
+        originals += [dup for dup, target in merged_into.items() if target in originals]
+        groups.append(sorted(set(originals)))
+
+    full_genericness = np.zeros(count)
+    for original, position in index_of.items():
+        full_genericness[original] = genericness[position]
+    return groups, full_genericness
+
+
 class EntityAggregator:
     """Links person observations across chunks into individuals.
 

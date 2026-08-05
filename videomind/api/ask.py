@@ -35,6 +35,8 @@ ROUTE_HINTS = {
                  "positive, negative or neutral; how a speaker's words came across",
     "ner": "named things mentioned: brands, product names, organisations, place names, "
            "people's names, dates and amounts",
+    "object_entities": "a particular object followed through the footage; the same "
+                       "cart or bag seen more than once; what an item was used for over time",
     "cooccurrence": "which people appeared together at the same time; who was accompanied "
                     "by whom; pairs of people sharing a segment",
 }
@@ -173,6 +175,16 @@ def build_context(question: str, record: dict, hits: list[dict]) -> tuple[str, d
             + (f" ({e['actor']})" if e.get("actor") else "")
             for e in events[:15]))
         used["events"] = min(len(events), 15)
+
+    if "object_entities" in routed and (objects := aggregates.get("object_entities", {}).get("objects")):
+        tracked = [o for o in objects if o["appearances"] > 1][:6]
+        if tracked:
+            blocks.append("OBJECTS TRACKED ACROSS SEGMENTS:\n" + "\n".join(
+                f"- {o.get('description') or o['signature'][:80]} "
+                f"(seen {o['appearances']}x, {o['first_seen']:.0f}-{o['last_seen']:.0f}s)"
+                + (f"\n    {o['narrative']}" if o.get("narrative") else "")
+                for o in tracked))
+            used["object_entities"] = len(tracked)
 
     if "chapters" in routed and (chapters := aggregates.get("chapters", {}).get("chapters")):
         blocks.append("CHAPTERS:\n" + "\n".join(
