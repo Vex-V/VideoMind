@@ -1,10 +1,10 @@
-"""Start the VideoMind server.
+"""Start VideoMind.
 
-    python serve.py [--port 8077]
+    python serve.py                # API + web UI
+    python serve.py --api-only     # API only, no UI
 
-Sets the quieting env vars before anything imports transformers, then hands
-off to uvicorn. `python -m uvicorn videomind.api.app:app` works too - app.py
-sets the same vars - but this is the tidier entry point.
+Sets the quieting environment variables before anything imports transformers,
+then hands off to uvicorn.
 """
 
 import argparse
@@ -17,16 +17,29 @@ os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 warnings.filterwarnings("ignore")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the VideoMind server.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8077)
-    parser.add_argument("--reload", action="store_true")
+    parser.add_argument("--reload", action="store_true", help="restart on code changes")
+    parser.add_argument("--api-only", action="store_true",
+                        help="serve the API without the web UI")
     args = parser.parse_args()
+
+    # Read by videomind.api.ui at import time, so it must be set before uvicorn
+    # imports the app - including in the reloader's child process.
+    if args.api_only:
+        os.environ["VIDEOMIND_UI"] = "0"
 
     import uvicorn
 
-    print(f"VideoMind -> http://{args.host}:{args.port}")
+    what = "API" if args.api_only else "API + UI"
+    print(f"VideoMind ({what}) -> http://{args.host}:{args.port}")
+    if not args.api_only:
+        print(f"  UI    http://{args.host}:{args.port}/")
+    print(f"  docs  http://{args.host}:{args.port}/docs")
+
     uvicorn.run(
         "videomind.api.app:app",
         host=args.host,
@@ -34,3 +47,7 @@ if __name__ == "__main__":
         reload=args.reload,
         log_level="info",
     )
+
+
+if __name__ == "__main__":
+    main()

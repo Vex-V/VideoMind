@@ -14,6 +14,7 @@ from qdrant_client.models import (
     VectorParams,
 )
 
+from ..paths import VECTOR_DIR, ensure as ensure_dirs
 from .embedder import DEFAULT_MODEL, get_embedder
 from .render import VECTOR_FIELDS
 
@@ -140,8 +141,9 @@ def config_key(
 
 
 class ChunkStore:
-    def __init__(self, path: str = "./vectordb", model_name: str = DEFAULT_MODEL):
-        self.client = QdrantClient(path=path)
+    def __init__(self, path: str | None = None, model_name: str = DEFAULT_MODEL):
+        ensure_dirs()
+        self.client = QdrantClient(path=str(path or VECTOR_DIR))
         self.embedder = get_embedder(model_name)
         self._ensure_collection()
 

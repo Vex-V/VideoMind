@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 
+from ...paths import MODEL_DIR, ensure as ensure_dirs
+
 _model = None
 _model_name = None
 
@@ -9,12 +11,19 @@ Detection = tuple[tuple[int, int, int, int], str, float]
 
 
 def _get_model(name: str = "yolo11n.pt"):
-    """YOLO detector, loaded once. Weights download on first use."""
+    """YOLO detector, loaded once.
+
+    Weights are kept under the data directory rather than dropped in whatever
+    the working directory happened to be, which is where ultralytics puts them
+    by default.
+    """
     global _model, _model_name
     if _model is None or _model_name != name:
         from ultralytics import YOLO
 
-        _model = YOLO(name)
+        ensure_dirs()
+        local = MODEL_DIR / name
+        _model = YOLO(str(local) if local.exists() else name)
         _model_name = name
     return _model
 

@@ -4,11 +4,10 @@ import re
 from pathlib import Path
 from typing import Any, Callable
 
-from .. import analyzers, store
+from .. import aggregators, analyzers, store
 from ..chunk import chunk_video
+from ..paths import RECORDS_DIR, UPLOAD_DIR, ensure as ensure_dirs
 from ..vectordb import ChunkStore, config_key
-
-RECORDS_DIR = Path("records")
 
 
 def video_id_for(video_path: str) -> str:
@@ -32,6 +31,7 @@ def upload(
     interval: float | None = None,
     min_duration: float = 5.0,
     max_duration: float = 20.0,
+    aggregate: bool = True,
     chunk_store: ChunkStore | None = None,
     progress: Callable[[str, dict], None] | None = None,
 ) -> dict:
@@ -121,19 +121,29 @@ def upload(
     # Named for readability - a bare content hash is useless when you are
     # grepping records to see what an upload produced. The id stays in the
     # filename so two videos with the same name cannot collide.
-    RECORDS_DIR.mkdir(exist_ok=True)
+    ensure_dirs()
     stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(video_path).stem)[:48].strip("_")
     for stale in RECORDS_DIR.glob(f"*__{video_id[:8]}.json"):
         stale.unlink()
     store.save(record, str(RECORDS_DIR / f"{stem}__{video_id[:8]}.json"))
 
-    return {
+    result = {
         "video_id": video_id,
         "video_path": video_path,
         "chunk_config": cfg,
         "chunks": len(chunks),
         "indexed": indexed,
     }
+
+    # Aggregators read the record just written, so they run as a final stage
+    # rather than needing the video again.
+    if aggregate:
+        try:
+            result["aggregated"] = run_aggregators(video_id, progress=progress)
+        except Exception as exc:
+            result["aggregated"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    return result
 
 
 def list_videos() -> list[dict]:
@@ -168,11 +178,23 @@ def record_path_for(video_id: str) -> Path | None:
 
 
 def video_path_for(video_id: str) -> str | None:
-    """Resolve an ingested video's file path from its saved record."""
+    """Resolve an ingested video's file path from its saved record.
+
+    Records store the path used at upload time, which stops resolving if the
+    data directory is moved or the app is run from elsewhere. The filename is
+    the stable part, so fall back to looking it up in the current upload
+    directory rather than reporting the video as missing.
+    """
     path = record_path_for(video_id)
     if path is None:
         return None
-    return json.loads(path.read_text(encoding="utf-8")).get("video")
+    stored = json.loads(path.read_text(encoding="utf-8")).get("video")
+    if not stored:
+        return None
+    if Path(stored).exists():
+        return stored
+    relocated = UPLOAD_DIR / Path(stored.replace("\\", "/")).name
+    return str(relocated) if relocated.exists() else stored
 
 
 def _timecode(seconds: float) -> str:
@@ -249,6 +271,99 @@ def _shape(hit: dict, detail: str) -> dict:
             "texts": hit.get("texts", []),
         })
     return base
+
+
+def run_aggregators(
+    video_id: str,
+    aggregator_ids: list[str] | None = None,
+    force: bool = False,
+    chunk_store: ChunkStore | None = None,
+    progress: Callable[[str, dict], None] | None = None,
+) -> dict:
+    """Run video-level passes over a video's stored analyzer output.
+
+    Separate from ingestion on purpose: aggregators read `records/`, not the
+    video, so re-summarising or re-linking after tuning costs no re-analysis.
+
+    Results already stored are reused unless `force`. Four of these bill an
+    API call per run, so re-uploading a video to add one analyzer would
+    otherwise re-buy its summary, chapters, events and entities every time.
+    """
+    path = record_path_for(video_id)
+    if path is None:
+        raise ValueError(f"No such video {video_id!r}")
+    record = json.loads(path.read_text(encoding="utf-8"))
+
+    analyzers_now = sorted(record.get("analyzers", []))
+    requested = aggregator_ids or aggregators.available()
+    order = aggregators.resolve_order(requested, analyzers_now)
+    skipped = sorted(set(requested) - set(order))
+
+    # Aggregates summarise whatever analyzers existed when they ran. Adding an
+    # analyzer later makes them stale - a summary written before `people` ran
+    # describes a video it could not see people in - so the whole set is
+    # recomputed rather than serving a confidently outdated answer.
+    stale = record.get("aggregates_analyzers") != analyzers_now
+    force = force or stale
+
+    cs = chunk_store or ChunkStore()
+    owns_store = chunk_store is None
+    ctx = aggregators.AggregateContext(
+        record=record, video_path=record["video"], store=cs,
+        results=dict(record.get("aggregates", {})),
+    )
+
+    produced, failed, reused = {}, {}, []
+    try:
+        for aggregator_id in order:
+            if not force and aggregator_id in ctx.results:
+                reused.append(aggregator_id)
+                continue
+            if progress:
+                progress("aggregating", {"aggregator": aggregator_id})
+            try:
+                result = aggregators.get(aggregator_id).aggregate(ctx)
+            except Exception as exc:
+                # One aggregator failing must not lose the others' work.
+                failed[aggregator_id] = f"{type(exc).__name__}: {exc}"
+                continue
+            if result is not None:
+                ctx.results[aggregator_id] = result
+                produced[aggregator_id] = result
+    finally:
+        if owns_store:
+            cs.close()
+
+    record["aggregates"] = ctx.results
+    record["aggregates_analyzers"] = analyzers_now
+    store.save(record, str(path))
+
+    return {
+        "video_id": video_id,
+        "ran": list(produced),
+        "reused": reused,            # already stored; pass force=True to recompute
+        "skipped": skipped,          # dependencies this video cannot satisfy
+        "failed": failed,
+        "aggregates": list(ctx.results),
+        "recomputed_because_analyzers_changed": stale,
+        "llm_calls_saved": [a for a in reused if a in aggregators.USES_LLM],
+    }
+
+
+def get_aggregates(video_id: str, aggregator_id: str | None = None) -> dict | None:
+    """Stored aggregator output for a video."""
+    path = record_path_for(video_id)
+    if path is None:
+        return None
+    record = json.loads(path.read_text(encoding="utf-8"))
+    stored = record.get("aggregates", {})
+    if aggregator_id:
+        if aggregator_id not in stored:
+            raise ValueError(
+                f"Video has no {aggregator_id!r} aggregate; it has {sorted(stored)}"
+            )
+        return {"video_id": video_id, "aggregator": aggregator_id, "result": stored[aggregator_id]}
+    return {"video_id": video_id, "available": sorted(stored), "aggregates": stored}
 
 
 def get_video(video_id: str) -> dict | None:
@@ -410,6 +525,79 @@ def query(
             "detail": detail, "answer": answer, "results": results}
 
 
+def answer(
+    question: str,
+    video_ids: list[str] | None = None,
+    analyzer_id: str | None = None,
+    limit: int = 6,
+    chunk_store: ChunkStore | None = None,
+    model: str | None = None,
+) -> dict:
+    """Answer a question using a video's aggregates as well as its segments.
+
+    Distinct from `query`, which retrieves segments and summarises the ones it
+    found. Here the question is routed to whichever aggregates can answer it -
+    entity narratives for questions about a person, novelty for "what is
+    unusual", statistics for counts - because those already contain the
+    cross-segment reasoning that searching chunks one at a time cannot recover.
+    """
+    from . import ask as ask_module
+
+    videos = video_ids or [v["video_id"] for v in list_videos()]
+    if not videos:
+        return {"question": question, "answer": None, "sources": {}, "results": [],
+                "error": "No videos ingested."}
+
+    cs = chunk_store or ChunkStore()
+    owns_store = chunk_store is None
+    contexts, sources, results = [], {}, []
+    try:
+        for video_id in videos:
+            path = record_path_for(video_id)
+            if path is None:
+                continue
+            record = json.loads(path.read_text(encoding="utf-8"))
+            analyzers_present = record.get("analyzers", [])
+            search_as = analyzer_id or next(
+                (a for a in ("default_video", "people", "diarization", "transcript",
+                             "object_detection", "ocr") if a in analyzers_present),
+                None,
+            )
+            hits = []
+            if search_as:
+                hits = cs.search(
+                    question, field="combined", limit=limit,
+                    video_ids=[video_id], analyzer_ids=[search_as],
+                )
+            shaped = [_shape(h, "standard") for h in hits]
+            results.extend(shaped)
+            context, used = ask_module.build_context(question, record, shaped)
+            if context:
+                contexts.append(f"=== VIDEO {video_id} ===\n{context}")
+                sources[video_id] = used
+    finally:
+        if owns_store:
+            cs.close()
+
+    if not contexts:
+        return {"question": question, "answer": None, "sources": {}, "results": [],
+                "error": "Nothing indexed for the requested videos."}
+
+    from ..extractors.video.openai_call import DEFAULT_MODEL, _get_client
+
+    response = _get_client().chat.completions.create(
+        model=model or DEFAULT_MODEL,
+        messages=[{"role": "user", "content": ask_module.PROMPT.format(
+            question=question, context="\n\n".join(contexts))}],
+    )
+    return {
+        "question": question,
+        "answer": response.choices[0].message.content.strip(),
+        "sources": sources,
+        "results": results,
+    }
+
+
 SYNTHESIS_PROMPT = """\
 You are answering a question about video footage using retrieved segment \
 descriptions. Answer only from the segments provided - if they do not support an \
@@ -427,8 +615,11 @@ Segments:
 def _synthesize(question: str, results: list[dict], model: str | None = None) -> str:
     from ..extractors.video.openai_call import DEFAULT_MODEL, _get_client
 
+    # Whichever body the detail level carried: `text` only appears at
+    # detail="full", `snippet` only at "minimal", `description` in between.
     segments = "\n\n".join(
-        f"[{r['video_id']} {r['start']:.2f}-{r['end']:.2f}s] (score {r['score']})\n{r['text']}"
+        f"[{r['video_id']} {r['start']:.2f}-{r['end']:.2f}s] (score {r['score']})\n"
+        f"{r.get('text') or r.get('description') or r.get('snippet') or ''}"
         for r in results
     )
     prompt = SYNTHESIS_PROMPT.format(question=question, segments=segments)

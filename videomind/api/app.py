@@ -15,23 +15,35 @@ import shutil
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-from .. import analyzers
+from .. import aggregators, analyzers
+from ..paths import UPLOAD_DIR, ensure as ensure_dirs
 from ..vectordb.render import VECTOR_FIELDS
 from ..vectordb.store import FILTER_SPEC
-from . import core, jobs
+from . import core, jobs, ui
 
-UPLOAD_DIR = Path("uploads")
-STATIC_DIR = Path(__file__).parent / "static"
+app = FastAPI(
+    title="VideoMind",
+    version="0.1.0",
+    description="Video RAG: chunk, analyse, aggregate, search and ask.",
+)
 
-app = FastAPI(title="VideoMind", version="0.1.0")
+# The API is the product; the UI is one optional client of it.
+if ui.enabled():
+    app.include_router(ui.router)
 
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+@app.get("/health")
+def health():
+    """Liveness plus what this instance has loaded."""
+    return {
+        "status": "ok",
+        "ui": ui.enabled(),
+        "analyzers": analyzers.available(),
+        "aggregators": aggregators.available(),
+    }
 
 
 @app.get("/media/{video_id}")
@@ -129,6 +141,13 @@ def schema():
             name: {"type": spec["type"], "matches": spec["kind"], "payload_field": spec["key"]}
             for name, spec in FILTER_SPEC.items()
         },
+        "aggregators": {
+            name: {
+                "depends_on": list(agg.depends_on),
+                "uses_llm": name in aggregators.USES_LLM,
+            }
+            for name, agg in sorted(aggregators.REGISTRY.items())
+        },
     }
 
 
@@ -177,6 +196,69 @@ def get_chunks(
     if result is None:
         raise HTTPException(404, f"No such video {video_id!r}")
     return result
+
+
+@app.get("/videos/{video_id}/aggregates")
+def get_aggregates(video_id: str, aggregator: str | None = None):
+    """Video-level results: summary, chapters, events, stats, entities, and so on."""
+    try:
+        result = core.get_aggregates(video_id, aggregator_id=aggregator)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if result is None:
+        raise HTTPException(404, f"No such video {video_id!r}")
+    return result
+
+
+@app.post("/videos/{video_id}/aggregates", status_code=202)
+def run_aggregates(video_id: str,
+                   aggregators_csv: str | None = Form(None, alias="aggregators"),
+                   force: bool = Query(True, description="Recompute even if already stored")):
+    """Re-run aggregators over already-analysed output.
+
+    Separate from upload because aggregators read `records/` rather than the
+    video: re-summarising or re-linking after a change costs no re-analysis.
+    """
+    if core.record_path_for(video_id) is None:
+        raise HTTPException(404, f"No such video {video_id!r}")
+    ids = [a.strip() for a in aggregators_csv.split(",") if a.strip()] if aggregators_csv else None
+    try:
+        if ids:
+            for name in ids:
+                aggregators.get(name)
+    except KeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    job_id = jobs.create()
+    jobs.run_in_background(job_id, core.run_aggregators, video_id, aggregator_ids=ids, force=force)
+    return {"job_id": job_id, "status": "queued", "video_id": video_id}
+
+
+@app.get("/videos/{video_id}/entities")
+def get_entities(video_id: str, min_appearances: int = Query(1, ge=1)):
+    """People linked across chunks, with their timelines."""
+    try:
+        result = core.get_aggregates(video_id, aggregator_id="entities")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if result is None:
+        raise HTTPException(404, f"No such video {video_id!r}")
+
+    entities = [
+        e for e in result["result"]["entities"]
+        if e["appearances"] >= min_appearances
+    ]
+    timelines = {}
+    try:
+        stored = core.get_aggregates(video_id, aggregator_id="entity_timelines")
+        timelines = {t["entity_id"]: t for t in stored["result"]["timelines"]}
+    except ValueError:
+        pass  # timelines are optional
+
+    for entity in entities:
+        if entity["entity_id"] in timelines:
+            entity["timeline"] = timelines[entity["entity_id"]]
+    return {"video_id": video_id, "total": len(entities), "entities": entities}
 
 
 @app.get("/videos/{video_id}/chunks/{chunk_id}")
@@ -229,7 +311,7 @@ async def upload_video(
     else:
         raise HTTPException(400, f"Unknown mode {mode!r}; expected preset|weights|interval")
 
-    UPLOAD_DIR.mkdir(exist_ok=True)
+    ensure_dirs()
     dest = UPLOAD_DIR / file.filename
     with dest.open("wb") as out:
         shutil.copyfileobj(file.file, out)
@@ -258,6 +340,31 @@ def job_status(job_id: str):
 @app.get("/jobs")
 def all_jobs():
     return {"jobs": jobs.all_jobs()}
+
+
+class AskRequest(BaseModel):
+    question: str
+    video_ids: list[str] | None = None
+    analyzer: str | None = None
+    limit: int = Field(6, ge=1, le=20)
+
+
+@app.post("/ask")
+def ask(request: AskRequest):
+    """Answer a question using the video's aggregates as well as its segments.
+
+    `/query` finds segments; this answers questions. The question is routed to
+    whichever aggregates can address it, so "what did the woman in grey do"
+    reaches the entity narratives and "which part is unusual" reaches novelty.
+    """
+    if request.analyzer and request.analyzer not in analyzers.available():
+        raise HTTPException(400, f"Unknown analyzer {request.analyzer!r}")
+    return core.answer(
+        request.question,
+        video_ids=request.video_ids,
+        analyzer_id=request.analyzer,
+        limit=request.limit,
+    )
 
 
 @app.post("/query")
