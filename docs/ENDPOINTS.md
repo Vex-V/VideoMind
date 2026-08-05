@@ -339,7 +339,7 @@ same hits at `minimal`:
 |---|---|
 | `minimal` | ids, timecodes, score, 180-char snippet — for agents |
 | `standard` | plus description and facets — what the UI renders |
-| `full` | plus `text`, `persons`, `detections`, `texts` |
+| `full` | plus `text`, `detections`, `texts` |
 
 The agent pattern is `detail=minimal` to choose, then
 `GET /videos/{id}/chunks?chunk_ids=…` to read the few that matter — roughly

@@ -87,7 +87,7 @@ def upload(
     record["video_id"] = video_id
     record["chunk_config"] = cfg
 
-    indexed = {}
+    indexed, subjects_indexed = {}, {}
     try:
         for analyzer_id in analyzer_ids:
             analyzer = analyzers.get(analyzer_id)
@@ -114,6 +114,10 @@ def upload(
 
             report("indexing", analyzer=analyzer_id)
             indexed[analyzer_id] = cs.add_chunks(video_id, video_path, payload, analyzer_id, cfg)
+            if subjects := _subjects_of(analyzer, payload):
+                subjects_indexed[analyzer_id] = cs.add_subjects(
+                    video_id, video_path, subjects, analyzer_id, cfg
+                )
     finally:
         if owns_store:
             cs.close()
@@ -133,6 +137,7 @@ def upload(
         "chunk_config": cfg,
         "chunks": len(chunks),
         "indexed": indexed,
+        "subjects_indexed": subjects_indexed,
     }
 
     # Aggregators read the record just written, so they run as a final stage
@@ -144,6 +149,63 @@ def upload(
             result["aggregated"] = {"error": f"{type(exc).__name__}: {exc}"}
 
     return result
+
+
+def _subjects_of(analyzer, chunks: list[dict]) -> list[dict]:
+    """Per-subject records from an analyzer that produces them, if it does.
+
+    Optional by design: an analyzer gains person- or object-level search by
+    growing one method, and one that has no subjects to offer needs no change
+    at all. Same contract as render_fields - the store never learns which
+    analyzer it is talking to.
+    """
+    render = getattr(analyzer, "render_subjects", None)
+    if render is None:
+        return []
+    return [
+        {"chunk_id": chunk["id"], "start": chunk["start"], "end": chunk["end"], **subject}
+        for chunk in chunks
+        for subject in render(chunk["output"])
+    ]
+
+
+def index_subjects(
+    video_id: str | None = None,
+    chunk_store: ChunkStore | None = None,
+) -> dict:
+    """Build subject points from saved records, for videos ingested before them.
+
+    Costs no API calls: the person descriptions are already on disk, so this is
+    re-embedding text the analyzers produced, exactly as scripts/reindex.py does
+    for chunks.
+    """
+    paths = sorted(RECORDS_DIR.glob("*.json")) if RECORDS_DIR.exists() else []
+    cs = chunk_store or ChunkStore()
+    owns_store = chunk_store is None
+
+    out: dict[str, dict[str, int]] = {}
+    try:
+        for path in paths:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if video_id and record.get("video_id") != video_id:
+                continue
+            for analyzer_id in record.get("analyzers", []):
+                analyzer = analyzers.get(analyzer_id)
+                chunks = [
+                    {"id": c["id"], "start": c["start"], "end": c["end"], "output": c[analyzer_id]}
+                    for c in record.get("chunks", [])
+                    if c.get(analyzer_id)
+                ]
+                if subjects := _subjects_of(analyzer, chunks):
+                    count = cs.add_subjects(
+                        record["video_id"], record["video"], subjects,
+                        analyzer_id, record["chunk_config"],
+                    )
+                    out.setdefault(record["video_id"], {})[analyzer_id] = count
+    finally:
+        if owns_store:
+            cs.close()
+    return out
 
 
 def list_videos() -> list[dict]:
@@ -262,15 +324,137 @@ def _shape(hit: dict, detail: str) -> dict:
         "turns": hit.get("turns", []),
     })
     if detail == "full":
-        # The heavy nested records: every person's full description, every
-        # detected object, every read string. Nothing renders these in the UI.
+        # The heavy nested records: every detected object, every read string.
+        # Nothing renders these in the UI. Per-person records are not here -
+        # they already come back in `people` at "standard".
         base.update({
             "text": hit["text"],
-            "persons": hit.get("persons", []),
             "detections": hit.get("detections", []),
             "texts": hit.get("texts", []),
         })
     return base
+
+
+def _shape_person(hit: dict, detail: str) -> dict:
+    """Trim a person hit, on the same appetite scale as a chunk hit."""
+    base = {
+        "video_id": hit["video_id"],
+        "chunk_id": hit["chunk_id"],
+        "start": hit["start"],
+        "end": hit["end"],
+        "timecode": f"{_timecode(hit['start'])}-{_timecode(hit['end'])}",
+        "score": round(hit["score"], 4),
+        # The whole point of the collection: what this one person was wearing,
+        # not what everyone in the segment was wearing.
+        "clothing": hit.get("clothing", ""),
+    }
+    if detail == "minimal":
+        return base
+
+    base.update({
+        "person_id": hit.get("point_id"),
+        "box_id": hit.get("box_id"),
+        "role": hit.get("role", ""),
+        "action": hit.get("action", ""),
+        "appearance": hit.get("appearance", ""),
+    })
+    if detail == "full":
+        # Per-frame box geometry. Only a visual pass wants this; an agent
+        # reading it gains nothing from a wall of pixel coordinates.
+        base["locations"] = hit.get("locations", [])
+    return base
+
+
+def search_persons(
+    text: str,
+    video_ids: list[str] | None = None,
+    field: str = "clothing",
+    limit: int = 10,
+    score_threshold: float | None = None,
+    filters: dict | None = None,
+    detail: str = "standard",
+    chunk_store: ChunkStore | None = None,
+) -> dict:
+    """Find individual people across videos, rather than segments containing them.
+
+    The counterpart to `query` at person granularity. A chunk's `people` vector
+    joins everyone in it into one string, so searching it returns segments whose
+    *crowd* resembles the query; this searches one point per person, so a hit is
+    a person.
+    """
+    if detail not in DETAIL_LEVELS:
+        raise ValueError(f"Unknown detail {detail!r}; expected one of {list(DETAIL_LEVELS)}")
+
+    active = dict(filters or {})
+    if video_ids:
+        active["video_ids"] = video_ids
+
+    cs = chunk_store or ChunkStore()
+    owns_store = chunk_store is None
+    try:
+        hits = cs.search_subjects(
+            text, field=field, limit=limit, score_threshold=score_threshold, **active
+        )
+    finally:
+        if owns_store:
+            cs.close()
+
+    return {
+        "query": text,
+        "field": field,
+        "detail": detail,
+        "total": len(hits),
+        "results": [_shape_person(h, detail) for h in hits],
+    }
+
+
+def similar_persons(
+    point_id: str,
+    limit: int = 5,
+    video_ids: list[str] | None = None,
+    include_own_video: bool = False,
+    field: str = "clothing",
+    score_threshold: float | None = None,
+    detail: str = "standard",
+    chunk_store: ChunkStore | None = None,
+) -> dict:
+    """People who look like a given person, by default in other videos.
+
+    The cross-video primitive: search by an existing point's own vector rather
+    than by a description of it, so nothing is lost to re-wording. Their own
+    video is excluded by default because their own other sightings are always
+    their nearest neighbours and say nothing about anyone else's footage.
+    """
+    cs = chunk_store or ChunkStore()
+    owns_store = chunk_store is None
+    try:
+        subject = cs.get_subject(point_id)
+        if subject is None:
+            return {}
+        vector = (subject.get("vectors") or {}).get(field)
+        if vector is None:
+            raise ValueError(f"Person {point_id!r} has no {field!r} vector")
+
+        active: dict = {}
+        if video_ids:
+            active["video_ids"] = video_ids
+        if not include_own_video:
+            active["exclude_video_ids"] = [subject["video_id"]]
+
+        hits = cs.search_subjects(
+            list(vector), field=field, limit=limit,
+            score_threshold=score_threshold, **active,
+        )
+    finally:
+        if owns_store:
+            cs.close()
+
+    return {
+        "person": _shape_person({**subject, "score": 1.0, "point_id": point_id}, detail),
+        "field": field,
+        "total": len(hits),
+        "results": [_shape_person(h, detail) for h in hits],
+    }
 
 
 def run_aggregators(

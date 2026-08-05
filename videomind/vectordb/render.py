@@ -13,6 +13,18 @@ behaviour for a chunk the VLM saw nobody in.
 # Named vector spaces. "combined" must exist for every extractor.
 VECTOR_FIELDS = ("combined", "description", "people", "actions", "objects")
 
+# Named vector spaces for *subject* points - one per person rather than one per
+# chunk. A chunk's "people" vector joins everyone in it into one string, which
+# answers "which segment features someone like this" but cannot answer "which
+# person is this": ten people average into one point.
+#
+# Clothing alone carries identity, for the same reason the entity linker embeds
+# it alone - `appearance` drifts between chunks and sometimes carries
+# meta-commentary ("same woman as box 3") that an embedding reads as content. It
+# gets its own space so a query describing a build or a face can still find
+# someone, without contaminating the signature identity is decided on.
+SUBJECT_VECTOR_FIELDS = ("clothing", "appearance")
+
 
 def _structured_combined(output: dict) -> str:
     parts = [output.get("description", "")]

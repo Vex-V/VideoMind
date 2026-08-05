@@ -21,9 +21,10 @@ os.environ.setdefault("USE_TF", "0")
 warnings.filterwarnings("ignore")
 
 from videomind import analyzers
-from videomind.api.core import RECORDS_DIR
+from videomind.api.core import RECORDS_DIR, _subjects_of
 from videomind.paths import VECTOR_DIR
 from videomind.vectordb import ChunkStore
+from videomind.vectordb.store import SUBJECTS
 
 # Rebuilt rather than upserted into: a schema change (e.g. new named vectors)
 # is not compatible with the existing collection.
@@ -56,7 +57,13 @@ for path in records:
             if c.get(analyzer_id)
         ]
         n = cs.add_chunks(video_id, video_path, payload, analyzer_id, cfg) if payload else 0
-        print(f"{path.stem[:34]:36s} {analyzer_id:14s} {n:3d} points")
 
-print(f"\ntotal points: {cs.count()}")
+        # Analyzers that expose subjects also get one point per person, which
+        # is what makes a person searchable independently of their chunk.
+        subjects = _subjects_of(analyzer, payload)
+        s = cs.add_subjects(video_id, video_path, subjects, analyzer_id, cfg) if subjects else 0
+        extra = f" + {s:3d} subjects" if s else ""
+        print(f"{path.stem[:34]:36s} {analyzer_id:14s} {n:3d} points{extra}")
+
+print(f"\ntotal points: {cs.count()} chunks, {cs.count(SUBJECTS)} subjects")
 cs.close()

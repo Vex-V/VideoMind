@@ -20,8 +20,8 @@ from pydantic import BaseModel, Field
 
 from .. import aggregators, analyzers
 from ..paths import UPLOAD_DIR, ensure as ensure_dirs
-from ..vectordb.render import VECTOR_FIELDS
-from ..vectordb.store import FILTER_SPEC
+from ..vectordb.render import SUBJECT_VECTOR_FIELDS, VECTOR_FIELDS
+from ..vectordb.store import FILTER_SPEC, SUBJECT_FILTER_SPEC
 from . import core, jobs, ui
 
 app = FastAPI(
@@ -140,6 +140,19 @@ def schema():
         "filters": {
             name: {"type": spec["type"], "matches": spec["kind"], "payload_field": spec["key"]}
             for name, spec in FILTER_SPEC.items()
+        },
+        # /persons/search is a different granularity, so it has its own spaces
+        # and its own filters rather than sharing the chunk ones.
+        "person_search": {
+            "vector_fields": {
+                "clothing": "what one person was wearing - the identity signature",
+                "appearance": "build, hair and features of one person",
+            },
+            "filters": {
+                name: {"type": spec["type"], "matches": spec["kind"],
+                       "payload_field": spec["key"]}
+                for name, spec in SUBJECT_FILTER_SPEC.items()
+            },
         },
         "aggregators": {
             name: {
@@ -365,6 +378,83 @@ def ask(request: AskRequest):
         analyzer_id=request.analyzer,
         limit=request.limit,
     )
+
+
+class PersonSearchRequest(BaseModel):
+    text: str
+    video_ids: list[str] | None = None
+    field: str = "clothing"
+    limit: int = Field(10, ge=1, le=100)
+    score_threshold: float | None = None
+    detail: str = "standard"
+    filters: dict = Field(default_factory=dict)
+
+
+@app.post("/persons/search")
+def search_persons(request: PersonSearchRequest):
+    """Find individual people across videos.
+
+    `/query` returns segments; this returns people. A chunk's `people` vector
+    joins everyone in it into one string, so a segment full of shoppers matches
+    almost any description of a shopper. Here each person is their own point,
+    matched on their own clothing.
+    """
+    if request.field not in SUBJECT_VECTOR_FIELDS:
+        raise HTTPException(
+            400, f"Unknown field {request.field!r}; have {list(SUBJECT_VECTOR_FIELDS)}"
+        )
+    try:
+        return core.search_persons(
+            request.text,
+            video_ids=request.video_ids,
+            field=request.field,
+            limit=request.limit,
+            score_threshold=request.score_threshold,
+            filters=request.filters,
+            detail=request.detail,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/persons/{point_id}/similar")
+def similar_persons(
+    point_id: str,
+    limit: int = Query(5, ge=1, le=50),
+    video_ids: str | None = Query(None, description="Comma-separated; default all"),
+    include_own_video: bool = Query(False, description="Also return their own other sightings"),
+    field: str = "clothing",
+    score_threshold: float | None = None,
+    detail: str = "standard",
+):
+    """People resembling this one, in other videos by default.
+
+    Search by the stored vector rather than by a re-typed description, so the
+    comparison is the one the linker would make.
+    """
+    if field not in SUBJECT_VECTOR_FIELDS:
+        raise HTTPException(400, f"Unknown field {field!r}; have {list(SUBJECT_VECTOR_FIELDS)}")
+    ids = [v.strip() for v in video_ids.split(",") if v.strip()] if video_ids else None
+    try:
+        result = core.similar_persons(
+            point_id, limit=limit, video_ids=ids, include_own_video=include_own_video,
+            field=field, score_threshold=score_threshold, detail=detail,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not result:
+        raise HTTPException(404, f"No such person {point_id!r}")
+    return result
+
+
+@app.post("/persons/index", status_code=202)
+def index_persons(video_id: str | None = Query(None, description="Only this video")):
+    """Build person points from saved records.
+
+    For videos ingested before the subject collection existed. Re-embeds text
+    already on disk, so it costs no API calls and needs no re-analysis.
+    """
+    return {"indexed": core.index_subjects(video_id=video_id)}
 
 
 @app.post("/query")

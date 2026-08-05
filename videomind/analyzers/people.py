@@ -197,3 +197,44 @@ class PeopleAnalyzer:
         if doing := "; ".join(p.get("action", "") for p in people if p.get("action")):
             fields["actions"] = doing
         return fields
+
+    def render_subjects(self, output: dict) -> list[dict]:
+        """One record per person - the unit identity actually works at.
+
+        render_fields above joins every person in a chunk into a single string.
+        That is right for "which segment features someone like this" and wrong
+        for "which person is this": measured on the split halves, a chunk
+        *containing* the man in yellow shorts beat one that did not by 0.029,
+        while his own clothing line beat that same chunk's best by 0.095. Ten
+        people average into one point, and the query matches the average.
+
+        Clothing alone is the identity vector, for the reason the entity linker
+        embeds it alone. `appearance` is carried as its own vector rather than
+        dropped, so a query describing a build or a face can still find someone
+        without drifting into the signature identity is decided on.
+        """
+        subjects = []
+        for index, person in enumerate(output.get("people") or []):
+            clothing = (person.get("clothing") or "").strip()
+            if not clothing:
+                continue  # nothing to recognise them by
+            subjects.append({
+                "index": index,
+                "vectors": {
+                    k: v for k, v in (
+                        ("clothing", clothing),
+                        ("appearance", (person.get("appearance") or "").strip()),
+                    ) if v
+                },
+                "payload": {
+                    "box_id": person.get("box_id"),
+                    "clothing": clothing,
+                    "appearance": (person.get("appearance") or "").strip(),
+                    "role": (person.get("role") or "").strip(),
+                    "action": (person.get("action") or "").strip(),
+                    # Kept so a later visual pass can crop this person without
+                    # re-running detection over the video.
+                    "locations": person.get("locations") or [],
+                },
+            })
+        return subjects
