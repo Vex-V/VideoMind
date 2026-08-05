@@ -1,0 +1,77 @@
+\section{Introduction and Problem Understanding}
+
+\subsection{System Identification}
+
+This document specifies the design of \textbf{FalconVQA} --- \emph{Fast Augmented
+Language-based CONversational Video Question Answering} --- a retrieval and question
+answering system for recorded video, developed with surveillance footage as its
+primary application domain. The name records the four properties the system is
+designed around: retrieval that is \emph{fast} enough to be interactive, an index
+\emph{augmented} beyond the raw signal with structured descriptions produced by vision
+and audio models, a \emph{language-based} interface in which both the index and the
+query are natural language, and a \emph{conversational} access path in which an
+operator or an autonomous agent asks questions of a recording and receives cited
+answers rather than a list of files.
+
+\subsection{Problem Statement}
+
+Recorded surveillance exists as a continuous timeline indexed by nothing but a clock.
+Locating an incident therefore requires the operator to select a date and time and
+review the footage manually until the incident is observed. This procedure is
+tractable only when the time of the incident is already known. In practice it is not:
+what is available is a description of the event, obtained from a witness or a report
+--- for example, \emph{a man in a yellow shirt left a bag near the checkout}. No stage
+of the recording chain produces a record of what the footage contains, so no such
+description can be used as a query.
+
+General-purpose video understanding tools do not close this gap, because they are
+designed for edited media and depend on three properties that surveillance footage
+does not exhibit:
+
+\begin{itemize}
+  \item \textbf{Shot boundaries.} A fixed camera produces none.
+  \item \textbf{Speech.} A substantial proportion of surveillance footage is silent.
+  \item \textbf{Visually salient events.} Events of interest are typically brief and
+        visually unremarkable.
+\end{itemize}
+
+Applied to such footage, these tools either return the entire recording as a single
+segment or subdivide it into a large number of near-identical segments. Neither result
+is searchable.
+
+The problem addressed by this project is therefore twofold: to derive a descriptive
+representation of footage that possesses little intrinsic structure, and to make that
+footage retrievable through that representation. The operator states what is being
+looked for in natural language and receives the corresponding moment, timestamped and
+ready for playback.
+
+\subsection{Project Objectives}
+
+The system is required to deliver the following:
+
+\begin{enumerate}[label=O-\arabic*.,leftmargin=3.0em]
+  \item A processing pipeline that accepts a recording and renders it searchable by
+        description.
+  \item Semantic search returning ranked moments with timecodes, and question
+        answering that returns a synthesised answer with references to the moments it
+        was derived from.
+  \item Video-level output that can be read in place of watching the footage: a
+        summary, chapters, notable events, the people and objects that appear, and
+        any anomalies.
+  \item A multi-tenant web application in which uploading, searching, questioning and
+        playback are performed in a single workspace, with each operator's recordings
+        isolated from every other operator's.
+  \item A documented and self-describing HTTP API, so that the same capabilities can
+        be driven by an LLM agent rather than only by a human operator.
+\end{enumerate}
+
+\subsection{Document Organisation}
+
+Section~2 presents the solution and the processing pipeline in outline. Section~3 states
+the functional and non-functional requirements. Section~4 records the design
+enhancements that distinguish the system from a conventional caption-and-embed pipeline.
+Section~5 is the detailed design: each of the four pipeline stages, the models employed,
+the parameters governing them and the outputs produced. Section~6 specifies the
+architecture and technology stack, and Section~7 the database design across all four
+stores. Section~8 describes the user interface and the acceptance test plan. Section~9
+sets out the execution schedule and the distribution of work.

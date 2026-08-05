@@ -1,0 +1,746 @@
+import json
+import re
+from pathlib import Path
+from typing import Any, Callable
+from urllib.parse import urlparse
+
+from .. import aggregators, analyzers, poster, store, storage
+from ..chunk import chunk_video
+from ..paths import CACHE_DIR, RECORDS_DIR, ensure as ensure_dirs
+from ..vectordb import ChunkStore, config_key
+
+
+def validate_source(url: str) -> None:
+    """Reject a URL the fetcher will not accept, while a caller is still there
+    to be told. Ingest runs on a background thread, so anything not checked
+    here fails into a job the client has to poll to discover."""
+    scheme = urlparse(url).scheme.lower()
+    if scheme not in storage.ALLOWED_SCHEMES:
+        raise ValueError(
+            f"Unsupported URL scheme {scheme or '(none)'!r}; expected http or https"
+        )
+
+
+def resolve_source(source: str) -> dict:
+    """Turn whatever the caller supplied into a cached local file plus its
+    Storage identity.
+
+    A URL and a local path are the same thing to everything downstream, which
+    is why this returns one shape. The content hash inside it is the video id:
+    not the filename stem, because two different uploads both called `test.mp4`
+    would otherwise merge into one video's vectors.
+    """
+    if urlparse(source).scheme.lower() in storage.ALLOWED_SCHEMES:
+        return storage.fetch_source(source)
+    return storage.put_local(source)
+
+
+def upload(
+    source: str,
+    analyzer_ids: list[str] | None = None,
+    preset: str | None = "audio_video",
+    weights: dict[str, float] | None = None,
+    interval: float | None = None,
+    min_duration: float = 5.0,
+    max_duration: float = 20.0,
+    aggregate: bool = True,
+    chunk_store: ChunkStore | None = None,
+    progress: Callable[[str, dict], None] | None = None,
+) -> dict:
+    """Chunk a video, run the chosen analyzers, and index the results.
+
+    `source` is an http(s) URL or a path on this machine; either way the video
+    ends up in Storage and the pipeline runs against a local cached copy.
+
+    Chunking is one of three modes - `interval`, `weights`, or `preset` - see
+    chunk_video. Analyzers are chosen per upload because they differ wildly in
+    cost: the scene analyzer bills per chunk, transcription is free.
+    """
+    analyzer_ids = analyzer_ids or ["default_video"]
+    analyzers.validate_selection(analyzer_ids)  # fail fast before doing any work
+
+    def report(stage, **info):
+        if progress:
+            progress(stage, info)
+
+    # Before chunking: a slow download of a large video is the one stage that
+    # can run for minutes with nothing to show for it.
+    report("fetching")
+    media = resolve_source(source)
+    video_id, video_path = media["video_id"], media["local_path"]
+    cfg = config_key(preset, min_duration, max_duration, weights=weights, interval=interval)
+
+    # Before chunking, so a client polling the job can render the video as soon
+    # as it is decodable rather than waiting minutes for analysis to finish.
+    duration = poster.duration_of(video_path)
+    poster_url = _write_poster(video_id, video_path)
+
+    report("chunking")
+    chunks = chunk_video(
+        video_path,
+        preset=preset,
+        min_duration=min_duration,
+        max_duration=max_duration,
+        weights=weights,
+        interval=interval,
+    )
+    report("chunked", chunks=len(chunks))
+
+    ctx = analyzers.VideoContext(video_path)
+    cs = chunk_store or ChunkStore()
+    owns_store = chunk_store is None
+
+    # Reuse the existing record when re-running against the same chunking, so
+    # analyzers run earlier keep their output instead of being overwritten by
+    # whichever set this upload happened to request.
+    existing_path = record_path_for(video_id)
+    existing = json.loads(existing_path.read_text(encoding="utf-8")) if existing_path else None
+    if existing and existing.get("chunk_config") == cfg:
+        record = existing
+        record["analyzers"] = sorted(set(record.get("analyzers", [])) | set(analyzer_ids))
+        # The same bytes can arrive under a different name or from a different
+        # URL; the object that is actually current wins.
+        record.update(
+            video_url=media["video_url"],
+            storage_path=media["storage_path"],
+            source_url=media.get("source_url"),
+            filename=media["filename"],
+        )
+    else:
+        record = store.build(
+            media, chunks, preset=preset,
+            min_duration=min_duration, max_duration=max_duration,
+        )
+        record["analyzers"] = list(analyzer_ids)
+        # Chunk boundaries changed, so the old chunking's vectors no longer
+        # describe anything that exists - drop all of them for this video.
+        if existing:
+            cs.delete_video(video_id)
+    record["chunk_config"] = cfg
+    record["poster_url"] = poster_url
+    record["duration"] = duration
+    record["size_bytes"] = media.get("size_bytes")
+
+    indexed = {}
+    try:
+        for analyzer_id in analyzer_ids:
+            analyzer = analyzers.get(analyzer_id)
+            report("analyzing", analyzer=analyzer_id)
+            # Scoped to this analyzer: a broader delete would take out every
+            # other analyzer's vectors for the same video.
+            cs.delete_video(video_id, chunk_config=cfg, extractor_id=analyzer_id)
+            outputs = analyzer.analyze(chunks, ctx)
+
+            payload = []
+            for i, ((start, end), output) in enumerate(zip(chunks, outputs)):
+                if output is None:
+                    continue
+                store.attach(record, i, **{analyzer_id: output})
+                payload.append(
+                    {
+                        "id": i,
+                        "start": start,
+                        "end": end,
+                        "output": output,
+                        "fields": analyzer.render_fields(output),
+                    }
+                )
+
+            report("indexing", analyzer=analyzer_id)
+            indexed[analyzer_id] = cs.add_chunks(
+                video_id, media["video_url"], payload, analyzer_id, cfg
+            )
+    finally:
+        if owns_store:
+            cs.close()
+
+    # Named for readability - a bare content hash is useless when you are
+    # grepping records to see what an upload produced. The id stays in the
+    # filename so two videos with the same name cannot collide.
+    ensure_dirs()
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(media["filename"]).stem)[:48].strip("_")
+    for stale in RECORDS_DIR.glob(f"*__{video_id[:8]}.json"):
+        stale.unlink()
+    store.save(record, str(RECORDS_DIR / f"{stem}__{video_id[:8]}.json"))
+
+    result = {
+        "video_id": video_id,
+        "video_url": media["video_url"],
+        "poster_url": poster_url,
+        "storage_path": media["storage_path"],
+        "filename": media["filename"],
+        "duration": duration,
+        "size_bytes": media.get("size_bytes"),
+        "chunk_config": cfg,
+        "chunks": len(chunks),
+        "analyzers": record["analyzers"],
+        "indexed": indexed,
+    }
+
+    # Aggregators read the record just written, so they run as a final stage
+    # rather than needing the video again.
+    if aggregate:
+        try:
+            result["aggregated"] = run_aggregators(video_id, progress=progress)
+        except Exception as exc:
+            result["aggregated"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    return result
+
+
+POSTER_NAME = "poster.jpg"
+
+
+def _write_poster(video_id: str, video_path: str) -> str | None:
+    """Extract one frame and put it in the bucket beside the video.
+
+    Never fatal: a video that analysed fine must not fail its ingest because a
+    thumbnail could not be written, so every failure here degrades to no
+    poster rather than a failed job.
+    """
+    try:
+        data = poster.poster_bytes(video_path)
+        if not data:
+            return None
+        return storage.put_object(f"{video_id}/{POSTER_NAME}", data, "image/jpeg")
+    except Exception:
+        return None
+
+
+def list_videos() -> list[dict]:
+    """Videos that have been ingested, from their saved records."""
+    out = []
+    for path in sorted(RECORDS_DIR.glob("*.json")) if RECORDS_DIR.exists() else []:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        chunks = record.get("chunks", [])
+        out.append(
+            {
+                "video_id": record.get("video_id", path.stem),
+                "filename": record.get("filename"),
+                "video_url": record.get("video_url"),
+                "poster_url": record.get("poster_url"),
+                "duration": record.get("duration")
+                or (round(chunks[-1]["end"], 2) if chunks else 0.0),
+                "chunks": len(chunks),
+                "chunk_config": record.get("chunk_config"),
+                "analyzers": record.get("analyzers", []),
+            }
+        )
+    return out
+
+
+def delete_video(video_id: str) -> dict | None:
+    """Remove a video completely: vectors, record, bucket objects, cache.
+
+    Every store is dropped in one call because partial deletion is worse than
+    none - vectors without a record are unciteable, and an object without
+    either is unreachable bytes nothing will ever collect.
+
+    Storage failures are reported rather than raised: the record and the
+    vectors are the parts that make a video *visible*, and leaving those in
+    place because the bucket call failed would keep a deleted video searchable.
+    """
+    path = record_path_for(video_id)
+    if path is None:
+        return None
+    record = json.loads(path.read_text(encoding="utf-8"))
+
+    with ChunkStore() as cs:
+        cs.delete_video(video_id)
+
+    objects = [p for p in (record.get("storage_path"), f"{video_id}/{POSTER_NAME}") if p]
+    storage_error = None
+    try:
+        storage.delete(objects)
+    except Exception as exc:
+        storage_error = f"{type(exc).__name__}: {exc}"
+
+    path.unlink(missing_ok=True)
+    for cached in CACHE_DIR.glob(f"{video_id}.*"):
+        cached.unlink(missing_ok=True)
+
+    return {
+        "video_id": video_id,
+        "deleted": True,
+        "objects": objects,
+        **({"storage_error": storage_error} if storage_error else {}),
+    }
+
+
+def record_path_for(video_id: str) -> Path | None:
+    """Find a video's record. Records are named for readability, so this
+    matches on the `video_id` inside rather than on the filename."""
+    if not RECORDS_DIR.exists():
+        return None
+    for path in RECORDS_DIR.glob("*.json"):
+        try:
+            if json.loads(path.read_text(encoding="utf-8")).get("video_id") == video_id:
+                return path
+        except (json.JSONDecodeError, OSError):
+            continue
+    return None
+
+
+def video_url_for(video_id: str) -> str | None:
+    """The public Storage URL for an ingested video, for /media to redirect to."""
+    path = record_path_for(video_id)
+    if path is None:
+        return None
+    return json.loads(path.read_text(encoding="utf-8")).get("video_url")
+
+
+def video_path_for(video_id: str) -> str | None:
+    """A local file for an ingested video, downloading it back if the cache is cold.
+
+    Nothing stores a local path any more - it is derived from the content hash
+    every time - so this no longer has to guess where a moved file went.
+    """
+    path = record_path_for(video_id)
+    if path is None:
+        return None
+    record = json.loads(path.read_text(encoding="utf-8"))
+    return storage.local_path_for(video_id, record.get("storage_path"))
+
+
+def _timecode(seconds: float) -> str:
+    return f"{int(seconds // 60)}:{seconds % 60:05.2f}"
+
+
+# Bulky or internal keys, dropped unless explicitly asked for. `locations` is
+# per-frame box geometry that only the entity-linking pass needs, and an LLM
+# reading chunk output gains nothing from a wall of pixel coordinates.
+_INTERNAL_KEYS = ("locations",)
+
+
+def _strip(value, verbose: bool):
+    """Remove debug and geometry keys from an analyzer's output."""
+    if verbose or not isinstance(value, dict):
+        return value
+    cleaned = {
+        k: v for k, v in value.items()
+        if not k.startswith("_") and k not in _INTERNAL_KEYS
+    }
+    for key, inner in cleaned.items():
+        if isinstance(inner, list):
+            cleaned[key] = [_strip(item, verbose) for item in inner]
+    return cleaned
+
+
+DETAIL_LEVELS = ("minimal", "standard", "full")
+SNIPPET_CHARS = 180
+
+
+def _shape(hit: dict, detail: str) -> dict:
+    """Trim a search hit to the caller's appetite.
+
+    The same result serves a browser and an agent, and they want opposite
+    things. A page can render every nested record cheaply; an agent pays for
+    each one in context, where five full hits ran to ~19k tokens against ~80
+    for their identifiers. So detail is chosen per call rather than baked in.
+    """
+    base = {
+        "video_id": hit["video_id"],
+        "chunk_id": hit["chunk_id"],
+        "start": hit["start"],
+        "end": hit["end"],
+        "timecode": f"{_timecode(hit['start'])}-{_timecode(hit['end'])}",
+        "score": round(hit["score"], 4),
+    }
+    if detail == "minimal":
+        # Enough to decide what is worth fetching in full, and nothing more.
+        text = (hit.get("description") or hit.get("text") or "").strip()
+        base["snippet"] = text[:SNIPPET_CHARS] + ("..." if len(text) > SNIPPET_CHARS else "")
+        return base
+
+    base.update({
+        "video_url": hit.get("video_url"),
+        # `text` is the whole flattened record that was embedded - the UI
+        # renders `description`, so carrying both doubles the response for
+        # nothing. It returns at detail="full".
+        "description": hit.get("description", ""),
+        "people": hit.get("people", []),
+        "objects": hit.get("objects", []),
+        "actions": hit.get("actions", []),
+        "tags": hit.get("tags", []),
+        "speakers": hit.get("speakers", []),
+        "people_count": hit.get("people_count"),
+        "turns": hit.get("turns", []),
+    })
+    if detail == "full":
+        # The heavy nested records: every person's full description, every
+        # detected object, every read string. Nothing renders these in the UI.
+        base.update({
+            "text": hit["text"],
+            "persons": hit.get("persons", []),
+            "detections": hit.get("detections", []),
+            "texts": hit.get("texts", []),
+        })
+    return base
+
+
+def run_aggregators(
+    video_id: str,
+    aggregator_ids: list[str] | None = None,
+    force: bool = False,
+    chunk_store: ChunkStore | None = None,
+    progress: Callable[[str, dict], None] | None = None,
+) -> dict:
+    """Run video-level passes over a video's stored analyzer output.
+
+    Separate from ingestion on purpose: aggregators read `records/`, not the
+    video, so re-summarising or re-linking after tuning costs no re-analysis.
+
+    Results already stored are reused unless `force`. Four of these bill an
+    API call per run, so re-uploading a video to add one analyzer would
+    otherwise re-buy its summary, chapters, events and entities every time.
+    """
+    path = record_path_for(video_id)
+    if path is None:
+        raise ValueError(f"No such video {video_id!r}")
+    record = json.loads(path.read_text(encoding="utf-8"))
+
+    analyzers_now = sorted(record.get("analyzers", []))
+    requested = aggregator_ids or aggregators.available()
+    order = aggregators.resolve_order(requested, analyzers_now)
+    skipped = sorted(set(requested) - set(order))
+
+    # Aggregates summarise whatever analyzers existed when they ran. Adding an
+    # analyzer later makes them stale - a summary written before `people` ran
+    # describes a video it could not see people in - so the whole set is
+    # recomputed rather than serving a confidently outdated answer.
+    stale = record.get("aggregates_analyzers") != analyzers_now
+    force = force or stale
+
+    cs = chunk_store or ChunkStore()
+    owns_store = chunk_store is None
+    ctx = aggregators.AggregateContext(
+        record=record, store=cs,
+        results=dict(record.get("aggregates", {})),
+    )
+
+    produced, failed, reused = {}, {}, []
+    try:
+        for aggregator_id in order:
+            if not force and aggregator_id in ctx.results:
+                reused.append(aggregator_id)
+                continue
+            if progress:
+                progress("aggregating", {"aggregator": aggregator_id})
+            try:
+                result = aggregators.get(aggregator_id).aggregate(ctx)
+            except Exception as exc:
+                # One aggregator failing must not lose the others' work.
+                failed[aggregator_id] = f"{type(exc).__name__}: {exc}"
+                continue
+            if result is not None:
+                ctx.results[aggregator_id] = result
+                produced[aggregator_id] = result
+    finally:
+        if owns_store:
+            cs.close()
+
+    record["aggregates"] = ctx.results
+    record["aggregates_analyzers"] = analyzers_now
+    store.save(record, str(path))
+
+    return {
+        "video_id": video_id,
+        "ran": list(produced),
+        "reused": reused,            # already stored; pass force=True to recompute
+        "skipped": skipped,          # dependencies this video cannot satisfy
+        "failed": failed,
+        "aggregates": list(ctx.results),
+        "recomputed_because_analyzers_changed": stale,
+        "llm_calls_saved": [a for a in reused if a in aggregators.USES_LLM],
+    }
+
+
+def get_aggregates(video_id: str, aggregator_id: str | None = None) -> dict | None:
+    """Stored aggregator output for a video."""
+    path = record_path_for(video_id)
+    if path is None:
+        return None
+    record = json.loads(path.read_text(encoding="utf-8"))
+    stored = record.get("aggregates", {})
+    if aggregator_id:
+        if aggregator_id not in stored:
+            raise ValueError(
+                f"Video has no {aggregator_id!r} aggregate; it has {sorted(stored)}"
+            )
+        return {"video_id": video_id, "aggregator": aggregator_id, "result": stored[aggregator_id]}
+    return {"video_id": video_id, "available": sorted(stored), "aggregates": stored}
+
+
+def get_video(video_id: str) -> dict | None:
+    """Metadata for one ingested video."""
+    path = record_path_for(video_id)
+    if path is None:
+        return None
+    record = json.loads(path.read_text(encoding="utf-8"))
+    chunks = record.get("chunks", [])
+    return {
+        "video_id": record.get("video_id"),
+        "filename": record.get("filename"),
+        "video_url": record.get("video_url"),
+        "poster_url": record.get("poster_url"),
+        "storage_path": record.get("storage_path"),
+        "source_url": record.get("source_url"),
+        "size_bytes": record.get("size_bytes"),
+        "preset": record.get("preset"),
+        "params": record.get("params", {}),
+        "chunk_config": record.get("chunk_config"),
+        "analyzers": record.get("analyzers", []),
+        "aggregates": sorted(record.get("aggregates", {})),
+        "chunks": len(chunks),
+        # The container's own duration when ingest recorded it; the last chunk's
+        # end is the fallback for records written before posters existed, and is
+        # only the same number when chunking covered the whole video.
+        "duration": record.get("duration")
+        or (round(chunks[-1]["end"], 2) if chunks else 0.0),
+    }
+
+
+def get_chunks(
+    video_id: str,
+    analyzer_id: str | None = None,
+    after: float | None = None,
+    before: float | None = None,
+    chunk_ids: list[int] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    verbose: bool = False,
+) -> dict | None:
+    """Stored analyzer output for a video's chunks, scoped and paginated.
+
+    This is the read side an agent or the UI uses to look at what was produced,
+    as opposed to searching for it. Always bounded so a caller cannot pull a
+    whole video's output into context by accident.
+    """
+    path = record_path_for(video_id)
+    if path is None:
+        return None
+    record = json.loads(path.read_text(encoding="utf-8"))
+    available = record.get("analyzers", [])
+    if analyzer_id and analyzer_id not in available:
+        raise ValueError(f"Video has no {analyzer_id!r} output; it has {available}")
+
+    # Batch fetch: an agent holding chunk ids from a search gets them all in
+    # one call instead of one round trip each.
+    wanted_ids = set(chunk_ids) if chunk_ids else None
+
+    selected = []
+    for chunk in record.get("chunks", []):
+        if wanted_ids is not None and chunk["id"] not in wanted_ids:
+            continue
+        if after is not None and chunk["end"] <= after:
+            continue
+        if before is not None and chunk["start"] >= before:
+            continue
+        wanted = [analyzer_id] if analyzer_id else available
+        outputs = {a: _strip(chunk[a], verbose) for a in wanted if chunk.get(a)}
+        if analyzer_id and not outputs:
+            continue  # nothing from that analyzer for this chunk
+        selected.append({
+            "chunk_id": chunk["id"],
+            "start": chunk["start"],
+            "end": chunk["end"],
+            "timecode": f"{_timecode(chunk['start'])}-{_timecode(chunk['end'])}",
+            **outputs,
+        })
+
+    return {
+        "video_id": video_id,
+        "analyzers": available,
+        "total": len(selected),
+        "offset": offset,
+        "limit": limit,
+        "chunks": selected[offset : offset + limit],
+    }
+
+
+def get_chunk(video_id: str, chunk_id: int, verbose: bool = False) -> dict | None:
+    """Everything every analyzer produced for one chunk."""
+    path = record_path_for(video_id)
+    if path is None:
+        return None
+    record = json.loads(path.read_text(encoding="utf-8"))
+    for chunk in record.get("chunks", []):
+        if chunk["id"] == chunk_id:
+            outputs = {
+                a: _strip(chunk[a], verbose)
+                for a in record.get("analyzers", [])
+                if chunk.get(a)
+            }
+            return {
+                "video_id": video_id,
+                "chunk_id": chunk_id,
+                "start": chunk["start"],
+                "end": chunk["end"],
+                "timecode": f"{_timecode(chunk['start'])}-{_timecode(chunk['end'])}",
+                **outputs,
+            }
+    return None
+
+
+def query(
+    text: str,
+    video_ids: list[str] | None = None,
+    analyzer_id: str = "default_video",
+    field: str = "combined",
+    limit: int = 5,
+    score_threshold: float | None = None,
+    synthesize: bool = True,
+    filters: dict | None = None,
+    detail: str = "standard",
+    chunk_store: ChunkStore | None = None,
+    model: str | None = None,
+) -> dict:
+    """Retrieve matching chunks and (optionally) synthesise a cited answer.
+
+    `detail` controls how much of each hit comes back: "minimal" for an agent
+    that will follow up on the ones it cares about, "standard" for the UI,
+    "full" for every nested record.
+
+    `filters` is passed through to the store against FILTER_SPEC, so a filter
+    added there is reachable here immediately. Unknown keys raise rather than
+    being ignored - a dropped filter returns plausible but wrong results.
+    """
+    analyzers.get(analyzer_id)  # validate
+    if detail not in DETAIL_LEVELS:
+        raise ValueError(f"Unknown detail {detail!r}; expected one of {list(DETAIL_LEVELS)}")
+
+    # `video_ids` and `analyzer` stay first-class because every caller uses
+    # them; they simply join the filter dict on the way down.
+    active = dict(filters or {})
+    if video_ids:
+        active["video_ids"] = video_ids
+    active["analyzer_ids"] = [analyzer_id]
+
+    cs = chunk_store or ChunkStore()
+    owns_store = chunk_store is None
+    try:
+        hits = cs.search(
+            text,
+            field=field,
+            limit=limit,
+            score_threshold=score_threshold,
+            **active,
+        )
+    finally:
+        if owns_store:
+            cs.close()
+
+    results = [_shape(h, detail) for h in hits]
+
+    answer = None
+    if synthesize and results:
+        answer = _synthesize(text, results, model=model)
+
+    return {"query": text, "analyzer": analyzer_id, "field": field,
+            "detail": detail, "answer": answer, "results": results}
+
+
+def answer(
+    question: str,
+    video_ids: list[str] | None = None,
+    analyzer_id: str | None = None,
+    limit: int = 6,
+    chunk_store: ChunkStore | None = None,
+    model: str | None = None,
+) -> dict:
+    """Answer a question using a video's aggregates as well as its segments.
+
+    Distinct from `query`, which retrieves segments and summarises the ones it
+    found. Here the question is routed to whichever aggregates can answer it -
+    entity narratives for questions about a person, novelty for "what is
+    unusual", statistics for counts - because those already contain the
+    cross-segment reasoning that searching chunks one at a time cannot recover.
+    """
+    from . import ask as ask_module
+
+    videos = video_ids or [v["video_id"] for v in list_videos()]
+    if not videos:
+        return {"question": question, "answer": None, "sources": {}, "results": [],
+                "error": "No videos ingested."}
+
+    cs = chunk_store or ChunkStore()
+    owns_store = chunk_store is None
+    contexts, sources, results = [], {}, []
+    try:
+        for video_id in videos:
+            path = record_path_for(video_id)
+            if path is None:
+                continue
+            record = json.loads(path.read_text(encoding="utf-8"))
+            analyzers_present = record.get("analyzers", [])
+            search_as = analyzer_id or next(
+                (a for a in ("default_video", "people", "diarization", "transcript",
+                             "object_detection", "ocr") if a in analyzers_present),
+                None,
+            )
+            hits = []
+            if search_as:
+                hits = cs.search(
+                    question, field="combined", limit=limit,
+                    video_ids=[video_id], analyzer_ids=[search_as],
+                )
+            shaped = [_shape(h, "standard") for h in hits]
+            results.extend(shaped)
+            context, used = ask_module.build_context(question, record, shaped)
+            if context:
+                contexts.append(f"=== VIDEO {video_id} ===\n{context}")
+                sources[video_id] = used
+    finally:
+        if owns_store:
+            cs.close()
+
+    if not contexts:
+        return {"question": question, "answer": None, "sources": {}, "results": [],
+                "error": "Nothing indexed for the requested videos."}
+
+    from ..extractors.video.openai_call import DEFAULT_MODEL, _get_client
+
+    response = _get_client().chat.completions.create(
+        model=model or DEFAULT_MODEL,
+        messages=[{"role": "user", "content": ask_module.PROMPT.format(
+            question=question, context="\n\n".join(contexts))}],
+    )
+    return {
+        "question": question,
+        "answer": response.choices[0].message.content.strip(),
+        "sources": sources,
+        "results": results,
+    }
+
+
+SYNTHESIS_PROMPT = """\
+You are answering a question about video footage using retrieved segment \
+descriptions. Answer only from the segments provided - if they do not support an \
+answer, say so plainly.
+
+Cite the segment behind every claim as [video_id start-end], using the exact \
+timecodes given. Keep it to a few sentences.
+
+Question: {question}
+
+Segments:
+{segments}"""
+
+
+def _synthesize(question: str, results: list[dict], model: str | None = None) -> str:
+    from ..extractors.video.openai_call import DEFAULT_MODEL, _get_client
+
+    # Whichever body the detail level carried: `text` only appears at
+    # detail="full", `snippet` only at "minimal", `description` in between.
+    segments = "\n\n".join(
+        f"[{r['video_id']} {r['start']:.2f}-{r['end']:.2f}s] (score {r['score']})\n"
+        f"{r.get('text') or r.get('description') or r.get('snippet') or ''}"
+        for r in results
+    )
+    prompt = SYNTHESIS_PROMPT.format(question=question, segments=segments)
+
+    response = _get_client().chat.completions.create(
+        model=model or DEFAULT_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.choices[0].message.content.strip()

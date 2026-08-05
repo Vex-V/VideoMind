@@ -1,105 +1,109 @@
-# VideoMind
+# FalconVQA
 
-Video RAG. Splits a video into meaningful chunks, runs analyzers over them,
-rolls those up into video-level insight, and makes the whole thing searchable
-and answerable — through a web UI, an HTTP API, or an LLM agent.
+**Fast Augmented Language-based CONversational Video Question Answering.**
+
+Ask questions about your videos and get answers grounded in what was actually said and shown,
+with timestamps and playable clips.
+
+- **frontend/** — Next.js app: projects, video upload, agent chat (AI SDK), clip artifact panel
+- **backend/** — FastAPI service wrapping the [VideoDB](https://videodb.io) Python SDK
+- **[API.md](API.md)** — every endpoint, what goes into VideoDB, and what comes back
 
 ```
-video ─▶ chunk ─▶ analyze ─▶ index ─▶ aggregate ─▶ search / ask
+Next.js  ──►  /api/agent (AI SDK tools)  ──►  FastAPI  ──►  VideoDB
+   │                                             │
+   ├──► Supabase Storage (files → public URL)     └──► Supabase (status writeback)
+   └──► Supabase DB (projects, conversations, messages, videos)
 ```
 
-## Quick start
+---
+
+## 1. Prerequisites
+
+| What | Where to get it |
+|---|---|
+| VideoDB API key | https://console.videodb.io — free, 50 uploads, no card |
+| Supabase project | URL, anon key, and service-role key |
+| A model provider key | OpenAI / Google / Groq / Cerebras / xAI (already in `frontend/.env.local`) |
+
+## 2. Database
+
+Run `frontend/lib/supabase/migrations/schema.sql` in the Supabase SQL editor. It creates
+`projects`, `conversations`, `messages`, and **`videos`**, plus the public `project-assets`
+storage bucket and RLS policies.
+
+Already ran an older copy? The `videos` table and its policies are the only new part —
+re-running the whole file is safe (everything is `IF NOT EXISTS` / `DROP … IF EXISTS`).
+
+## 3. Backend
 
 ```bash
-pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
-    --index-url https://download.pytorch.org/whl/cu130
-pip install -r requirements.txt
-
-echo "OPENAI_API_KEY=sk-..." >  .env
-echo "HF_TOKEN=hf_..."       >> .env      # diarization only
-
-python serve.py               # http://127.0.0.1:8077
+cd backend
+cp .env.example .env
+# fill in: VIDEO_DB_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+uv sync
+uv run uvicorn app.main:app --reload --port 8000
 ```
 
-`HF_TOKEN` is only needed for the `diarization` analyzer, and its model is
-gated — accept the terms at
-<https://huggingface.co/pyannote/speaker-diarization-community-1> first.
+Verify: http://localhost:8000/health → `{"status":"ok","videodb":"ok","supabase":"ok"}`.
+API docs: http://localhost:8000/docs
 
-Upload a video in the **Upload** tab, then use **Search**, **Ask**,
-**Insights** and **Details**.
+`SUPABASE_SERVICE_ROLE_KEY` is the same value as `NEXT_PUBLIC_SUPABASE_ADMIN` in
+`frontend/.env.local`, if that is what you have there.
 
-## How it works
+## 4. Frontend
 
-**Chunking** finds boundaries from four signals — speaker changes (pyannote),
-silence (Silero VAD), hard cuts (PySceneDetect) and semantic drift (CLIP) —
-fused with per-preset weights. Not every video offers every signal; unbroken
-CCTV has no cuts, silent footage no speaker turns. Weights are renormalised
-over the signals that actually fired, so a preset expresses *which signals
-matter* rather than doubling as a granularity dial. You can also supply your
-own weights, or cut at a fixed interval.
-
-**Analyzers** run per chunk. Each owns its own frame sampling, prompt and
-output shape, so a new one needs no changes anywhere else.
-
-| analyzer | needs | produces |
-|---|---|---|
-| `default_video` | frames | scene description, setting, people, objects, actions, tags |
-| `people` | frames | per-person appearance, role, action, box locations |
-| `object_detection` | frames | objects with appearance and purpose |
-| `ocr` | frames | on-screen text with context |
-| `transcript` | audio | speech text |
-| `diarization` | audio | speaker-attributed transcript |
-
-`ocr` and `object_detection` use cheap detectors (EasyOCR, YOLO) purely as
-*gates* — frames with nothing to read or see never reach a VLM. Detector
-labels are never shown to the VLM, because YOLO confidently called a
-thermal-imaged tank an "airplane" and a label written onto the image invites
-agreement with it.
-
-**Aggregators** run after analyzers, over their saved output rather than the
-video, so re-running one costs no re-analysis. Results are cached and only
-recomputed on demand or when the analyzer set changes.
-
-`stats` · `novelty` · `speaker_stats` · `summary` · `chapters` · `events` ·
-`ner` · `sentiment` · `entities` · `object_entities` · `entity_timelines` ·
-`cooccurrence`
-
-**Retrieval** stores one point per chunk in Qdrant with several named vectors
-(`combined`, `description`, `people`, `actions`, `objects`), so a query about
-appearance can match a short person description rather than compete with a
-whole record.
-
-**Ask** answers questions rather than returning segments, routing each question
-to the aggregates that can address it — a question about one person reaches the
-entity narratives, "what is unusual" reaches novelty.
-
-## Layout
-
-```
-serve.py            entry point
-videomind/
-  paths.py          every path, overridable by environment variable
-  chunk.py          chunking modes
-  chunking/         boundary fusion
-  boundaries/       the four signal detectors
-  analyzers/        per-chunk passes  (add one here)
-  aggregators/      video-level passes (add one here)
-  extractors/       shared primitives: frames, audio, VLM, detectors
-  vectordb/         embedding + Qdrant store
-  api/              core logic, HTTP routes, jobs, web UI
-docs/               COMMANDS.md, ENDPOINTS.md
-scripts/            reindex.py, bench.py
-media/              test assets
-data/               all runtime state (gitignored)
+```bash
+cd frontend
+npm install
+npm run dev
 ```
 
-## Docs
+Runs on http://localhost:3000. It talks to the backend at `VIDEODB_BACKEND_URL`, which
+defaults to `http://localhost:8000` — only set it if you changed the port.
 
-- [docs/COMMANDS.md](docs/COMMANDS.md) — running, resetting, inspecting
-- [docs/ENDPOINTS.md](docs/ENDPOINTS.md) — full API reference
-- [CLAUDE.md](CLAUDE.md) — design decisions and known limitations
+Both servers need to be running: the frontend alone cannot ingest or retrieve.
 
-## Requirements
+---
 
-Python 3.13, a CUDA GPU (developed on an RTX 4060, 8 GB), and an OpenAI API
-key. Everything except the VLM calls and answer synthesis runs locally.
+## Using it
+
+1. **Create a project** at `/projects` → "New Project". You land on the project workspace.
+2. **Upload videos** — "Upload file" (top right). Drag files in, or paste direct/YouTube URLs
+   under "Or add file URLs". Files go to Supabase Storage; their public URL is what VideoDB
+   ingests.
+3. **Wait for indexing.** Each card shows a status pill: `Uploading` → `Indexing` → `Ready`.
+   The grid polls every 5 s. Indexing is genuinely slow — several minutes for a short clip,
+   longer for a full-length video. Only `Ready` videos are searchable.
+4. **Ask something** in the prompt box (or click a suggestion card). This creates a chat with
+   every ready video pre-tagged.
+5. **In the chat**, use the **Videos** button next to the model selector to tag exactly which
+   videos to search. Tagged videos show as chips above the input.
+
+### What to ask
+
+| You say | The agent calls |
+|---|---|
+| "What is this video about?" / "Summarize it" | `ask_video` — answer + source moments |
+| "Find the moment where they discuss X" | `search_video_moments` — timestamped moments |
+| "Show me clips of X" / "Make a highlight reel" | retrieval + `show_clips` → **artifact panel** |
+| "What exactly did they say at 2:30?" | `get_video_transcript` |
+| "How many scenes are outdoors?" | `aggregate_video_index` |
+| "Every scene tagged as a conversation" | `query_video_index` |
+
+Clips open in the right-hand **artifact panel**: a player on top, the clip list below.
+Click any row to play that moment; "Play all" plays them back to back. The chat message
+stays short and cites `m:ss` timestamps.
+
+### Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| "Cannot reach the video backend" | The FastAPI server isn't running on port 8000 |
+| Upload fails on a big file | Supabase caps uploads at 50 MB by default — raise the bucket limit, or add the video by URL instead |
+| Video stuck on `Indexing` | Normal for long videos. Check the backend logs; `Failed` cards offer **Re-index** from the card menu |
+| Agent says a video isn't searchable | Its status isn't `Ready` yet — that is the intended behaviour, not a bug |
+| `/health` shows `videodb: error` | `VIDEO_DB_API_KEY` missing or wrong in `backend/.env` |
+
+Cost/quality knobs (scene segmentation, VLM tier, frame count, resolution) live in
+`backend/.env` — see `backend/README.md`.

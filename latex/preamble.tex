@@ -1,0 +1,74 @@
+% Packages, styling and shared macros. Included by report.tex.
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}   % \text in the fusion equation, Section 5
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\usepackage[section]{placeins}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta}
+
+% Keep every table inside the subsection that introduces it, instead of drifting
+% past the next heading.
+\let\oldsubsection\subsection
+\renewcommand{\subsection}{\FloatBarrier\oldsubsection}
+
+\graphicspath{{images/}}
+
+% --- look and feel -----------------------------------------------------------
+\definecolor{accent}{HTML}{1F4E79}
+\titleformat{\section}{\large\bfseries\color{accent}}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.6em}{}
+\titlespacing*{\section}{0pt}{1.4em}{0.6em}
+\setlist[itemize]{leftmargin=1.4em,itemsep=0.25em,topsep=0.3em}
+\captionsetup{font=small,labelfont=bf}
+\renewcommand{\arraystretch}{1.25}
+
+% Include a figure only if the file is present, so the report compiles
+% before the images have been dropped in. Arguments: filename, caption,
+% width as a fraction of \textwidth, label.
+\newcommand{\optfigure}[4]{%
+  \IfFileExists{images/#1}{%
+    \begin{figure}[htbp]
+      \centering
+      \includegraphics[width=#3\textwidth]{#1}
+      \caption{#2}\label{#4}
+    \end{figure}%
+  }{%
+    \begin{figure}[htbp]
+      \centering
+      \fbox{\parbox[c][3.5cm][c]{0.8\textwidth}{\centering\itshape
+        Missing figure: \texttt{images/#1}}}
+      \caption{#2}\label{#4}
+    \end{figure}%
+  }%
+}
+
+% Left-aligned fixed-width column, used by every table in the report.
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+% --- diagram styles (Section 7, database design) -----------------------------
+\definecolor{store}{HTML}{2E7D5B}   % storage tiers
+\definecolor{muted}{HTML}{5B6670}   % edge labels and notes
+
+\tikzset{
+  entity/.style={
+    draw=accent, line width=0.9pt, fill=accent!6, rounded corners=2.5pt,
+    inner sep=6pt, align=center, font=\small, minimum width=2.9cm},
+  extbox/.style={
+    draw=muted, line width=0.7pt, fill=muted!8, rounded corners=2.5pt,
+    dash pattern=on 3pt off 2pt,
+    inner sep=6pt, align=center, font=\small, minimum width=2.9cm},
+  storebox/.style={
+    draw=store, line width=0.9pt, fill=store!6, rounded corners=2.5pt,
+    inner sep=6pt, align=center, font=\small, minimum width=3.1cm},
+  rel/.style={draw=muted, line width=0.7pt, -{Latex[length=2mm]}},
+  card/.style={font=\scriptsize\color{muted}, inner sep=1.5pt},
+  keyflow/.style={draw=store, line width=0.9pt, -{Latex[length=2.2mm]}},
+}
